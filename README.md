@@ -1,1 +1,1 @@
-# glance
+# Glance: a Vulkan rendering demo

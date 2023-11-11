@@ -12,5 +12,6 @@ code_to_string :: ($code : Code) -> string #must {
 
 offset_of :: ($T: Type, $identifier : Code) -> s64 #must #expand {
     base : *T = null;
+    #assert !is_constant(base.#insert identifier);
     return cast(*u8) (*base.#insert identifier) - cast(*u8) (base);
 }

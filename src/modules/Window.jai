@@ -318,7 +318,11 @@ WindowMessage :: enum {
 
 SAVED_WINDOW_PLACEMENT_FILE_NAME :: "saved_window_placement.bin";
 
-window_procedure :: (hwnd : HWND, msg : u32, w_param : WPARAM, l_param : LPARAM) -> LRESULT #c_call {
+window_procedure :: (hwnd: HWND, msg: u32, w_param: WPARAM, l_param: LPARAM) -> LRESULT #c_call {
+    if ImGui_ImplWin32_WndProcHandler(hwnd, msg, w_param, l_param) {
+        return 1;
+    }
+
     window := cast,no_check(*Window) GetWindowLongPtrA(hwnd, GWLP_USERDATA);
 
     if msg == {
@@ -409,3 +413,4 @@ Thread :: #import "Thread";
           #import "Windows";
           #import "Windows_Utf8";
 File   :: #import "File";
+          #import "imgui_impl_win32";

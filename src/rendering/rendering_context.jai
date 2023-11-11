@@ -6,9 +6,10 @@
  */
 
 RenderingContext :: struct {
-    INFINITE             : u64 : 0xFFFF_FFFF_FFFF_FFFF;
-    INVALID_FAMILY_INDEX : u32 : 0xFFFF_FFFF;
-    MAX_FRAMES_IN_FLIGHT : u64 : 2;
+    INFINITE             : u64      : 0xFFFF_FFFF_FFFF_FFFF;
+    INVALID_FAMILY_INDEX : u32      : 0xFFFF_FFFF;
+    MAX_FRAMES_IN_FLIGHT : u64      : 2;
+    BACKBUFFER_FORMAT    : VkFormat : .VK_FORMAT_B8G8R8A8_UNORM;
 
     jai_context : *Context;
     window      : *Window.Window;
@@ -156,7 +157,7 @@ update :: (using this : *RenderingContext) {
 #scope_file
 
 #import "stb_image";
-#import,file "Vulkan/module.jai";
+#import "Vulkan";
 
 #load "vulkan_loader.jai";
 
@@ -165,6 +166,7 @@ update :: (using this : *RenderingContext) {
 #load "vk_debug_utils.jai";
 #load "vk_texture.jai";
 #load "vk_vertex.jai";
+#load "vk_imgui.jai";
 
 #if GPU_DEBUG {
     #load "runtime_shaders_recompiler.jai";
@@ -685,7 +687,6 @@ recreate_swapchain :: (using this : *RenderingContext) {
         SWAPCHAIN_BUFFERS_COUNT : u32 : 2;
         Basic.assert(capabilities.minImageCount <= SWAPCHAIN_BUFFERS_COUNT && (capabilities.maxImageCount == 0 || SWAPCHAIN_BUFFERS_COUNT <= capabilities.maxImageCount));
 
-        BACKBUFFER_FORMAT : VkFormat            : .VK_FORMAT_B8G8R8A8_UNORM;
         surface_format    : *VkSurfaceFormatKHR = null;
         for format, ix : formats {
             if (format.format == BACKBUFFER_FORMAT) {
@@ -1261,6 +1262,17 @@ draw_frame :: (using this : *RenderingContext) {
                 vkCmdDrawIndexed(command_buffer, xx indicies.count, 1, 0, 0, 0);
             }
 
+            ImGui_ImplVulkan_NewFrame();
+            ImGui_ImplWin32_NewFrame();
+            ImGui.NewFrame();
+
+            ImGui.ShowDemoWindow();
+
+            ImGui.Render();
+            draw_data := ImGui.GetDrawData();
+            ImGui_ImplVulkan_RenderDrawData(draw_data, command_buffer);
+
+
             //
             // End rendering
             //
@@ -1294,6 +1306,9 @@ draw_frame :: (using this : *RenderingContext) {
         };
         vk_call(vkQueueSubmit(queue, 1, *submit_info, fences[frame_index]));
     }
+
+
+
 
     //
     // Presenting

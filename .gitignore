@@ -27,10 +27,12 @@
 *.a
 *.lib
 
-# Executables
+# Executables and runtime files
 *.exe
 *.out
 *.app
+*.dmp
+*.bin
 
 # Build directories
 .build/

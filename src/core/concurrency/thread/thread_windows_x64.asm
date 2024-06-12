@@ -1,12 +1,56 @@
-_TEXT$aligned64 segment align(64)
-    public switch_context
-    public switch_context_implicit
-    public execution_context_trampoline
+_TEXT$ALIGNED segment align(64) alias(".text")
+    public thread_set_context
+    public thread_switch_context
+    public thread_switch_context_implicit
+    public thread_execution_context_start_trampoline
 
     rbp_slot equ 8
     rip_slot equ 8
 
-    execution_context_size equ 224
+    execution_context_size             equ 224
+    execution_context_create_info_size equ 16
+
+    align 64
+
+    ;   /// Sets current thread context to a new one discarding active.
+    ;
+    ;   @param activate       - A suspended context that should be activated.
+    ;   @param resume_context - 4-bit payload that will be appended to resume context. Setting any of the 60 remaining bits is prohibited.
+    ;
+    ;   jai prototype
+    ;       thread_set_context :: (
+    ;           activate       : ExecutionContext,
+    ;           resume_context : ResumeContext
+    ;       ) #foreign self_assembly;
+    ;
+    thread_set_context proc
+        ; Load new context.
+        mov       rbx, [rcx + (8 * 0)]
+        mov       rbp, [rcx + (8 * 1)]
+        mov       rdi, [rcx + (8 * 2)]
+        mov       rsi, [rcx + (8 * 3)]
+        mov       r12, [rcx + (8 * 4)]
+        mov       r13, [rcx + (8 * 5)]
+        mov       r14, [rcx + (8 * 6)]
+        mov       r15, [rcx + (8 * 7)]
+        vmovaps  xmm6, [rcx + (8 * 8 + 16 * 0)]
+        vmovaps  xmm7, [rcx + (8 * 8 + 16 * 1)]
+        vmovaps  xmm8, [rcx + (8 * 8 + 16 * 2)]
+        vmovaps  xmm9, [rcx + (8 * 8 + 16 * 3)]
+        vmovaps xmm10, [rcx + (8 * 8 + 16 * 4)]
+        vmovaps xmm11, [rcx + (8 * 8 + 16 * 5)]
+        vmovaps xmm12, [rcx + (8 * 8 + 16 * 6)]
+        vmovaps xmm13, [rcx + (8 * 8 + 16 * 7)]
+        vmovaps xmm14, [rcx + (8 * 8 + 16 * 8)]
+        vmovaps xmm15, [rcx + (8 * 8 + 16 * 9)]
+
+        mov rsp, rcx ; Set new stack frame.
+        mov rax, rdx ; Set resume context.
+
+        mov r8, [rsp + execution_context_size + rbp_slot]     ; Load return address.
+        add rsp, execution_context_size + rbp_slot + rip_slot ; For some reason, branch predictor likes 'jmp' more rather than doing canonical 'ret'.
+        jmp r8
+    thread_set_context endp
 
     align 64
 
@@ -23,7 +67,7 @@ _TEXT$aligned64 segment align(64)
     ;           resume_payload : u64
     ;       ) -> ResumeContext #foreign self_assembly "switch_context";
     ;
-    switch_context proc
+    thread_switch_context proc
         ; RBP slot is allocated only for alignment.
         sub rsp, rbp_slot + execution_context_size
 
@@ -68,36 +112,42 @@ _TEXT$aligned64 segment align(64)
         vmovaps xmm15, [rcx + (8 * 8 + 16 * 9)]
 
         mov rax, rsp ; Set previous stack frame as resume context.
-        or  rax, rdx ; Append resume payload.
+        xor rax, rdx ; Append resume payload.
         mov rsp, rcx ; Set new stack frame.
 
         mov r8, [rsp + execution_context_size + rbp_slot]     ; Load return address.
         add rsp, execution_context_size + rbp_slot + rip_slot ; For some reason, branch predictor likes 'jmp' more than doing canonical 'ret'.
         jmp r8
-    switch_context endp
+    thread_switch_context endp
 
     align 64
 
     ;   /// Performs switch to a suspended context.
     ;
-    ;   @Remarks:
-    ;       Resume context of the activated context will not contain information the about suspended context as the resume is perfomed in implicit mode.
+    ;   @Discussion:
+    ;       This function does not set resume context data pointer to suspended context. Instead, it will save it
+    ;       to the provided savepoint allowing setting resume context to any arbitrary data.
     ;
-    ;   @param suspend        - Place where to save handle to the suspended context.
-    ;   @param activate       - Newly created context that should be activated.
-    ;   @param resume_payload - 4-bit payload that will be appended to resume context. Setting any of the 60 remaining bits is prohibited.
+    ;       This function should not be a part of any high level API, as it gives too much control over context switch,
+    ;       making it very bug-prone in environments that were not carefully validated.
+    ;
+    ;   @param savepoint      - Savepoint for the handle of the context being suspended.
+    ;   @param activate       - Context that should be activated.
+    ;   @param resume_context - Resume context of the switch.
     ;
     ;   @return Context of the control flow regain (aka switchback).
     ;
+    ;
     ;   jai prototype:
-    ;       switch_context_implicit :: (
-    ;           suspend        : *ExecutionContext,
+    ;       thread_switch_context_implicit :: (
+    ;           savepoint      : *ExecutionContext,
     ;           activate       : ExecutionContext,
     ;           resume_payload : u64
-    ;       ) -> ResumeContext #foreign self_assembly "switch_context_implicit";
+    ;       ) -> ResumeContext #foreign self_assembly "thread_windows_x64";
     ;
-    switch_context_implicit proc
+    thread_switch_context_implicit proc
         ; RBP slot is allocated only for alignment.
+        mov r10, [rdx + (8 * 0)]
         sub rsp, rbp_slot + execution_context_size
 
         ; Save current context.
@@ -141,26 +191,25 @@ _TEXT$aligned64 segment align(64)
         vmovaps xmm15, [rdx + (8 * 8 + 16 * 9)]
 
         mov [rcx], rsp ; Save handle of the suspended context to the provided storage.
-        xor rax, rax   ; Clear resume context.
-        or  rax, rdx   ; Append resume payload.
         mov rsp, rdx   ; Set new stack frame.
+        mov rax, r8    ; Set resume context.
 
         mov r9, [rsp + execution_context_size + rbp_slot]     ; Load return address.
         add rsp, execution_context_size + rbp_slot + rip_slot ; For some reason, branch predictor likes 'jmp' more rather than doing canonical 'ret'.
         jmp r9
-    switch_context_implicit endp
+    thread_switch_context_implicit endp
 
     align 64
 
-    ; @Todo: doc
-    execution_context_trampoline proc
+    ; /// Starts a newly created context by rewiring return values from {set, switch}_context to procedure call arguments.
+    thread_execution_context_start_trampoline proc
         mov rcx, rax           ; Set resume context.
         mov rdx, [rsp + 8 * 0] ; Set invocation payload.
         mov r8,  [rsp + 8 * 1] ; Load context startup function.
-        add rsp, 24
+        add rsp, rip_slot + execution_context_create_info_size
         jmp r8
-    execution_context_trampoline endp
+    thread_execution_context_start_trampoline endp
 
-_TEXT$aligned64 ENDS
+_TEXT$ALIGNED ENDS
 
 end

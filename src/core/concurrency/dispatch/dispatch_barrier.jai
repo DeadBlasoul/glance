@@ -4,10 +4,10 @@ DispatchBarrier :: struct(count : s64 = 0) {
     lock_count : s64;
 
     #if count == {
-        case 0; lock_array : []ExecutionContext;
-                swap_array : []ExecutionContext;
+        case 0; lock_array : []Dispatch;
+                swap_array : []Dispatch;
 
-        case;   lock_array : [count - 1]ExecutionContext;
+        case;   lock_array : [count - 1]Dispatch;
     }
 }
 
@@ -18,44 +18,47 @@ arrive_and_wait :: (barrier : *DispatchBarrier) {
     //
     // Barrier block path.
     //
+
     if lock_count != count {
+        dispatch_thread_context := get_dispatch_thread_context();
+
         resume_context := switch_dispatch_thread_execution_context_implicit(
             savepoint = *barrier.lock_array[lock_count],
-            activate  = query_dispatch_looper(),
+            activate  = query_dispatch_looper(dispatch_thread_context),
             reason    = .resumed
         );
+        assert(unpack_reason(resume_context) == .resumed);
 
-        //@Todo: parse resume context
+        return;
     }
 
     //
     // Barrier release path.
     //
-    else {
-        // Wait for all ongoing suspends.
-        for ix : 0..barrier.lock_array.count - 1 {
-            while load(*barrier.lock_array[ix], memory_order = .acquire) == null memory_fence_store();
+
+    // Wait for all ongoing suspends.
+    for ix : 0..barrier.lock_array.count - 1 {
+        while load(*barrier.lock_array[ix], memory_order = .acquire) == .invalid memory_fence_store();
+    }
+
+    // Save lock array before cleaning it. Otherwise, we might get in data race when barrier releasing collides with the next round locks.
+    lock_array : [barrier.count - 1]Dispatch = barrier.lock_array;
+
+    memset(barrier.lock_array.data, 0, size_of(Dispatch) * barrier.lock_array.count);
+    store(*barrier.lock_count, 0, memory_order = .release);
+
+    // At this point barrier is set and done. We only need to resume suspended contexts.
+    dispatch_thread_context   := get_dispatch_thread_context();
+    dispatch_queue            := dispatch_thread_context.dispatch_queue;
+    dispatch_queue_dispatcher := dispatch_thread_context.dispatch_queue_dispatcher;
+
+    for locked_context : lock_array {
+        while !try_enqueue(*dispatch_queue.work_queue, dispatch_queue_dispatcher, create_dispatch_work_item(locked_context)) {
+            continue;
         }
 
-        // Save lock array before cleaning it. Otherwise, we might get in data-race when barrier releasing collides with the next round locks.
-        lock_array : [barrier.count - 1]ExecutionContext = barrier.lock_array;
-
-        memset(barrier.lock_array.data, 0, size_of(ExecutionContext) * barrier.lock_array.count);
-        store(*barrier.lock_count, 0, memory_order = .release);
-
-        // At this point barrier is set and done. We only need to resume suspended contexts.
-        dispatch_thread_context   := get_dispatch_thread_context();
-        dispatch_queue            := dispatch_thread_context.dispatch_queue;
-        dispatch_queue_dispatcher := dispatch_thread_context.dispatch_queue_dispatcher;
-
-        for locked_context : lock_array {
-            while !try_enqueue(*dispatch_queue.work_queue, dispatch_queue_dispatcher, create_dispatch_work_item(locked_context)) {
-                continue;
-            }
-
-            // @Todo: Use engine primitives.
-            SetEvent(dispatch_queue.progress);
-        }
+        // @Todo: Use engine primitives.
+        SetEvent(dispatch_queue.progress);
     }
 }
 

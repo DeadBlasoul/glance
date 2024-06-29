@@ -24,7 +24,7 @@ DispatchWorkItem :: union {
         dispatched_task_routine : (*void) -> ();
     };
 
-    dispatched_context : ExecutionContext; // Must be aligned by 8
+    dispatched_context : Dispatch; // Must be aligned by 8
 }
 #assert size_of(DispatchWorkItem) == 16;
 
@@ -46,8 +46,8 @@ create_dispatch_work_item :: inline (task_context : *T, task_routine : (*$T) -> 
     return work;
 }
 
-create_dispatch_work_item :: inline (suspended_context : ExecutionContext) -> DispatchWorkItem {
-    assert(suspended_context & dispatch_work_item_type_mask == null, "The provided suspended context pointer must be aligned by 8: %", suspended_context);
+create_dispatch_work_item :: inline (suspended_context : Dispatch) -> DispatchWorkItem {
+    assert(suspended_context & dispatch_work_item_type_mask == 0, "The provided suspended context pointer must be aligned by 8: %", suspended_context);
 
     work := DispatchWorkItem.{
         dispatched_context = suspended_context,
@@ -67,6 +67,6 @@ unpack_as_dispatched_task :: (work : DispatchWorkItem) -> (task_context : *void,
         work.dispatched_task_routine;
 }
 
-unpack_as_dispatched_context :: (work : DispatchWorkItem) -> ExecutionContext #expand {
+unpack_as_dispatched_context :: (work : DispatchWorkItem) -> Dispatch #expand {
     return work.dispatched_context & ~dispatch_work_item_type_mask;
 }

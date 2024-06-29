@@ -3,6 +3,7 @@ _TEXT$ALIGNED segment align(64) alias(".text")
     public thread_switch_context
     public thread_switch_context_implicit
     public thread_execution_context_start_trampoline
+    public sleep_in_user_mode
 
     rbp_slot equ 8
     rip_slot equ 8
@@ -210,6 +211,23 @@ _TEXT$ALIGNED segment align(64) alias(".text")
         jmp r8
     thread_execution_context_start_trampoline endp
 
-_TEXT$ALIGNED ENDS
+    align 64
+
+    ; /// Wait for the specified time in cycles.
+    sleep_in_user_mode proc
+        rdtsc             ; Read current TSC.
+
+        shl rdx, 32       ; Load hi part in the upper 32 bits of rdx.
+        xor rdx, rax      ; Load lo part in the lower 32 bits of rdx.
+        add rdx, rcx      ; Append requested wait time to the deadline.
+        mov eax, edx      ; Load lo part back to eax.
+        shr rdx, 32       ; Load hi part back to edx.
+
+        xor    r10d, r10d ; Make tpause to execute in C0.2 state.
+        tpause r10d       ; Pause or yield to another thread on the core.
+
+        ret
+    sleep_in_user_mode endp
+_TEXT$ALIGNED ends
 
 end

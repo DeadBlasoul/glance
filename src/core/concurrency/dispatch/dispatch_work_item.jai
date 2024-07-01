@@ -31,6 +31,9 @@ DispatchWorkItem :: union {
 DispatchWorkItemType :: enum {
     dispatched_task;
     dispatched_context;
+
+    // Special dispatch work item type. Should never be dispatch on the queue line.
+    dispatch_thread_stop_request;
 }
 dispatch_work_item_type_mask :: 0b111;
 
@@ -54,6 +57,12 @@ create_dispatch_work_item :: inline (suspended_context : Dispatch) -> DispatchWo
     };
     work.type |= .dispatched_context;
 
+    return work;
+}
+
+create_dispatch_thread_stop_request :: inline () -> DispatchWorkItem #deprecated "test function" {
+    work : DispatchWorkItem;
+    work.type |= .dispatch_thread_stop_request;
     return work;
 }
 

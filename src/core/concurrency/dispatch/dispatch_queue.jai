@@ -5,25 +5,25 @@ CONTEXT_MEMORY_POOL_CAPACITY :: 32;
 
 DispatchQueue :: struct {
     work_queue        : DispatchWorkQueue;
-    // context_pool      : DispatchLooperPool;
-    looper_allocator  : DispatchLooperAllocator(dispatch_stack_memory_size = 1 * 1024 * 1024, dispatch_memory_images_per_thread = 2);
-    thread_pool       : [..]DispatchThread;
     running_threads   : s64;
     progress          : Windows.HANDLE;
     progress_finished : Windows.HANDLE;
+
+    dispatch_looper_allocator : DispatchLooperAllocator(dispatch_stack_memory_size = 1 * 1024 * 1024, dispatch_memory_images_per_thread = 2);
+    dispatch_thread_pool      : [..]DispatchThread;
 }
 
 create_dispatch_queue :: (using dispatch_queue : *DispatchQueue, number_of_threads : s64) {
     create_queue(*work_queue, number_of_threads);
 
-    create_dispatch_looper_allocator(*looper_allocator, number_of_threads);
+    create_dispatch_looper_allocator(*dispatch_looper_allocator, number_of_threads);
 
     progress          = Windows.CreateEventA(null, 0, 0, null);
     progress_finished = Windows.CreateEventA(null, 1, 0, null);
     running_threads   = number_of_threads;
 
-    Basic.array_resize(*thread_pool, number_of_threads);
-    for *thread, thread_ix : thread_pool {
+    Basic.array_resize(*dispatch_thread_pool, number_of_threads);
+    for *thread, thread_ix : dispatch_thread_pool {
         // @Todo: Reduce stack size because we don't use it anyway.
         Thread.thread_init(thread, xx dispatch_thread_starter); {
             thread.dispatch_queue        = dispatch_queue;
@@ -33,13 +33,13 @@ create_dispatch_queue :: (using dispatch_queue : *DispatchQueue, number_of_threa
 }
 
 start_dispatch_queue :: (dispatch_queue : *DispatchQueue) {
-    for *thread : dispatch_queue.thread_pool {
+    for *thread : dispatch_queue.dispatch_thread_pool {
         Thread.thread_start(thread);
     }
 }
 
 destroy_dispatch_queue :: (using dispatch_queue: *DispatchQueue) {
-    for *thread: thread_pool {
+    for *thread: dispatch_thread_pool {
         thread.should_stop = true;
     }
 
@@ -48,13 +48,13 @@ destroy_dispatch_queue :: (using dispatch_queue: *DispatchQueue) {
     }
     Windows.WaitForSingleObject(progress_finished, Windows.INFINITE);
 
-    for *thread: thread_pool {
+    for *thread: dispatch_thread_pool {
         Windows.WaitForSingleObject(thread.windows_thread, Windows.INFINITE);
         Thread.thread_deinit(thread);
     }
 
     destroy_queue(*work_queue);
-    destroy_dispatch_looper_allocator(*looper_allocator);
+    destroy_dispatch_looper_allocator(*dispatch_looper_allocator);
 }
 
 dispatch_async :: (queue: *DispatchQueue, task_context : *T, dispatch_work : (task_context : *$T) -> ()) {
@@ -136,7 +136,7 @@ query_dispatch_looper :: (dispatch_thread_context : *DispatchThreadContext) -> D
     // There was no assigned looper, create a new one.
     //
 
-    return create_dispatch_looper(*dispatch_thread_context.dispatch_queue.looper_allocator, dispatch_thread_context.dispatch_thread_index);
+    return create_dispatch_looper(*dispatch_thread_context.dispatch_queue.dispatch_looper_allocator, dispatch_thread_context.dispatch_thread_index);
 }
 
 dispatch_thread_starter :: (thread : *DispatchThread) -> s64 {
@@ -163,12 +163,26 @@ dispatch_thread_starter :: (thread : *DispatchThread) -> s64 {
     // Invoke looper.
     //
 
-    // @Note: The stack provided by the OS is unmanagable. It does not correspond to DispathMemoryImage layout thus cannot be properly used.
     resume_context := switch_dispatch_thread_execution_context_implicit(
         savepoint = *dispatch_thread_context.dispatch_thread_starter,
         activate  = query_dispatch_looper(dispatch_thread_context),
-        reason    = .resumed
+        reason    = .resumed,
+        dispatch_thread_context
     );
+
+    dispatch_thread_context = get_dispatch_thread_context();
+
+    //
+    // Notify that progress of current thread is finished.
+    //
+
+    dispatch_queue := dispatch_thread_context.dispatch_queue;
+
+    // @Todo,@Cleanup: use engine primitives
+    Default_Atomics :: #import "Atomics";
+    if Default_Atomics.atomic_add(*dispatch_queue.running_threads, -1) == 1 { // Returns old value
+        SetEvent(dispatch_queue.progress_finished);
+    }
 
     //
     // Release dispatch that requested thread stop.
@@ -194,28 +208,29 @@ dispatch_thread_starter :: (thread : *DispatchThread) -> s64 {
     return 0;
 }
 
-dispatch_looper_starter :: (resume_context : DispatchResumeContext, looper_dispatch_context : *DispatchContext) #c_call {
+dispatch_looper_starter :: (resume_context : DispatchResumeContext, dispatch_looper_context : *DispatchContext) #c_call {
     //
     // Start looping.
     //
 
-    jai_context : Context;
+    stop_requester_dispatch : Dispatch = ---;
+    jai_context             : Context;
+
     push_context jai_context {
-        dispatch_looper_routine(resume_context, looper_dispatch_context);
+        stop_requester_dispatch = dispatch_looper_routine(resume_context);
     }
 
     //
     // Finish thread by switching back to its starter.
     //
 
-    dispatch_thread_context := get_dispatch_thread_context();
     discard_dispatch_thread_execution_context_explicit(
-        activate = dispatch_thread_context.dispatch_thread_starter,
+        activate = stop_requester_dispatch,
         reason   = .resumed
     );
 }
 
-dispatch_looper_routine :: (resume_context : DispatchResumeContext, looper_dispatch_context : *DispatchContext) {
+dispatch_looper_routine :: (resume_context : DispatchResumeContext) -> (stop_requester_dispatch : Dispatch) {
     dispatch_thread_context := get_dispatch_thread_context();
 
     dispatch_queue := dispatch_thread_context.dispatch_queue;
@@ -243,54 +258,67 @@ dispatch_looper_routine :: (resume_context : DispatchResumeContext, looper_dispa
                 assert(success);
 
             case .stop;
-                source_context := unpack_source(resume_context);
-                shutdown_context(activate = source_context, `looper_dispatch_context);
+                stop_requester_dispatch := unpack_source(resume_context);
+                `return stop_requester_dispatch;
         }
     }
 
     //
-    // Parse resume context beforehand. There might be pending actions that are required to be processed before starting the loop.
+    // Preprocess resume context beforehand as it might have pending actions to account.
     //
+
     process_resume_action(resume_context);
 
     //
-    // Main loop.
+    // Start looping.
     //
-    while main_loop := true {
+
+    decide_next_sleeping_mode :: inline (sleeping_index_counter : *s64) -> enum {sleep_in_user_mode; sleep_in_kernel_mode;} #no_context {
+        if sleeping_index_counter.* < 20 {
+            sleeping_index_counter.* += 1;
+            return .sleep_in_user_mode;
+        }
+        return .sleep_in_kernel_mode;
+    }
+
+    sleeping_index_counter := 0;
+
+    while looping := true {
         work_item : DispatchWorkItem = ---;
-        while consuming_new_dispatch := true {
-            um_sleeping_loop_cycles  ::    25_000;
-            um_sleeping_total_cycles :: 2_500_000;
 
-            for 0..um_sleeping_total_cycles / um_sleeping_loop_cycles - 1 {
-                if load(*dispatch_queue.thread_pool[thread_index].should_stop, memory_order = .acquire) {
-                    break main_loop;
-                }
-                if try_dequeue(*dispatch_queue.work_queue, *dispatch_consume_token, *work_item) {
-                    break consuming_new_dispatch;
-                }
-                sleep_in_user_mode(um_sleeping_loop_cycles);
-            }
+        //
+        // Consume dispatch.
+        //
 
-            while true {
-                if load(*dispatch_queue.thread_pool[thread_index].should_stop, memory_order = .acquire) {
-                    break main_loop;
+        if !try_dequeue(*dispatch_queue.work_queue, dispatch_consume_token, *work_item) {
+            if load(*dispatch_queue.dispatch_thread_pool[thread_index].should_stop, memory_order = .acquire) {
+                work_item = create_dispatch_thread_stop_request();
+            } else {
+                if #complete decide_next_sleeping_mode(*sleeping_index_counter) == {
+                    case .sleep_in_user_mode;
+                        sleep_in_user_mode(sleep_cycles = 25_000);
+
+                    case .sleep_in_kernel_mode;
+                        Windows.WaitForSingleObject(dispatch_queue.progress, milliseconds = 1);
                 }
-                if try_dequeue(*dispatch_queue.work_queue, *dispatch_consume_token, *work_item) {
-                    break consuming_new_dispatch;
-                }
-                Windows.WaitForSingleObject(dispatch_queue.progress, milliseconds = 1);
+                continue looping;
             }
         }
 
+        sleeping_index_counter = 0;
+
         //
-        // Execute dispatched job.
+        // Execute dispatch.
         //
+
         if #complete get_dispatch_work_item_type(work_item) == {
             case .dispatched_task;
                 task_context, task_routine := unpack_as_dispatched_task(work_item);
+
                 task_routine(task_context);
                 Basic.reset_temporary_storage();
+
+                dispatch_thread_context = get_dispatch_thread_context();
 
             case .dispatched_context;
                 dispatched_context := unpack_as_dispatched_context(work_item);
@@ -301,15 +329,27 @@ dispatch_looper_routine :: (resume_context : DispatchResumeContext, looper_dispa
                 resume_context = switch_dispatch_thread_execution_context_implicit(
                     savepoint = *dispatch_thread_context.dispatch_thread_looper,
                     activate  = dispatched_context,
-                    reason    = .resumed
+                    reason    = .resumed,
+                    dispatch_thread_context
                 );
+
+                dispatch_thread_context = get_dispatch_thread_context();
+                process_resume_action(resume_context);
+
+            case .dispatch_thread_stop_request;
+                resume_context = switch_dispatch_thread_execution_context_explicit(
+                    activate = consume_dispatch(*dispatch_thread_context.dispatch_thread_starter),
+                    reason   = .resumed
+                );
+
+                dispatch_thread_context = get_dispatch_thread_context();
                 process_resume_action(resume_context);
         }
 
         //
-        // Update current context as it might be changed.
+        // Update looper environment.
         //
-        dispatch_thread_context = get_dispatch_thread_context();
+
         if dispatch_queue != dispatch_thread_context.dispatch_queue || thread_index != dispatch_thread_context.dispatch_thread_index {
             dispatch_queue = dispatch_thread_context.dispatch_queue;
             thread_index   = dispatch_thread_context.dispatch_thread_index;
@@ -323,12 +363,6 @@ dispatch_looper_routine :: (resume_context : DispatchResumeContext, looper_dispa
                 }
             );
         }
-    }
-
-    // @Todo,@Cleanup: use engine primitives
-    Default_Atomics :: #import "Atomics";
-    if Default_Atomics.atomic_add(*dispatch_queue.running_threads, -1) == 1 { // Returns old value for fuck sake
-        SetEvent(dispatch_queue.progress_finished);
     }
 }
 

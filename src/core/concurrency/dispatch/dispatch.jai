@@ -2,11 +2,31 @@ Dispatch :: enum s64 {
     invalid;
 };
 
-consume_dispatch :: (dispatch_savepoint : *Dispatch) -> Dispatch {
-    dispatch            := dispatch_savepoint.*;
-    dispatch_savepoint.* = .invalid;
+/// Serialization type for Dispatch. In order to make a dispatch, must be reactivated by consuming it with `consume_dispatch`.
+/**
+ *  @Discussion:
+ *      The problem is to make sure that any serialized `Dispatch` object would be consumed (cleared with .invalid) right before dispatch.
+ *      Otherwise it will leave a dangling reference where it hardly to identify it was intentional or caused by a bug.
+ *
+ *      The current solution is to introduce a special kind of dispatch objects that are impossible to dispatch without deserializing them.
+ *
+ *      Serialization is done by dispatching functions (see dispatch_thread.jai).
+ */
+DispatchSavepoint :: enum s64 {
+    invalid;
+};
 
-    return dispatch;
+consume_dispatch :: (dispatch_savepoint : *DispatchSavepoint) -> Dispatch #no_context {
+    defer dispatch_savepoint.* = .invalid;
+    return cast(Dispatch) dispatch_savepoint.*;
+}
+
+consume_dispatch_from_immediate :: (dispatch_savepoint : DispatchSavepoint) -> Dispatch #no_context {
+    return cast(Dispatch) dispatch_savepoint;
+}
+
+serialize_dispatch :: (dispatch : Dispatch) -> DispatchSavepoint #no_context {
+    return cast(DispatchSavepoint) dispatch;
 }
 
 restore_dispatch_memory_pointer :: inline (dispatch : Dispatch) -> *DispatchMemoryImage #no_context {
@@ -20,7 +40,7 @@ DispatchAttributes :: enum_flags {
 };
 
 DispatchContext :: struct {
-    savepoint            : Dispatch;
+    savepoint            : DispatchSavepoint;
     attributes           : DispatchAttributes;
     requested_stack_size : s64;
     effective_stack_size : s64;

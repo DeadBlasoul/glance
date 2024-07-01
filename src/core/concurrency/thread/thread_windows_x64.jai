@@ -59,22 +59,24 @@ thread_create_execution_context :: (
 
     stack := as_stack_aligned(memory, execution_context_memory_alignment);
 
-    // We cannot create a new context and just give it execution control before it actually started its execution.
-    // The easiest way to workaround it would be to spoof a context that called thread_switch_context.
-    //
-    // So, to implement it we will use `thread_execution_context_start_trampoline` as return point from fake thread_switch_context call.
-    // It will rewire resume context and user data pointer as procedure call arguments leaving stack at [+0x18] when jump to user code is made.
-    //
-    // The following diagram shows stack state that we need:
-    // +----------------------------+
-    // |        pushed rip          |  [+0x18, +0x20)
-    // |     pushed rbp (unused)    |  [+0x10, +0x18)
-    // | ExecutionContextCreateInfo |  [+0x00, +0x10) <- prev frame addr, aligned by 16
-    // +----------------------------+
-    // |        pushed rip          |  [-0x08, +0x00)
-    // |     pushed rbp (unused)    |  [-0x10, -0x08)
-    // |       fake context         |  [-0xF0, -0x10) <- new rsp will be set here, still aligned by 16
-    // +----------------------------+
+    /*
+     * We cannot create a new context and just give it execution control before it actually started its execution.
+     * The easiest way to workaround it would be to spoof a context that called thread_switch_context.
+     *
+     * So, to implement it we will use `thread_execution_context_start_trampoline` as return point from fake thread_switch_context call.
+     * It will rewire resume context and user data pointer as procedure call arguments leaving stack at [+0x18] when jump to user code is made.
+     *
+     * The following diagram shows stack state that we need:
+     * +----------------------------+
+     * |        pushed rip          |  [+0x18, +0x20)
+     * |     pushed rbp (unused)    |  [+0x10, +0x18)
+     * | ExecutionContextCreateInfo |  [+0x00, +0x10) <- prev frame addr, aligned by 16
+     * +----------------------------+
+     * |        pushed rip          |  [-0x08, +0x00)
+     * |     pushed rbp (unused)    |  [-0x10, -0x08)
+     * |       fake context         |  [-0xF0, -0x10) <- new rsp will be set here, still aligned by 16
+     * +----------------------------+
+     */
 
     //
     // Allocation 1: Trampoline frame.
@@ -156,19 +158,11 @@ thread_switch_context_implicit :: (
 ) -> ResumeContext #foreign thread_lib;
 
 /// Wait for the specified time in cycles.
-sleep_in_user_mode :: (cycles : s64) #foreign thread_lib;
+sleep_in_user_mode :: (sleep_cycles : s64) #foreign thread_lib;
 
 os_thread_yield :: () {
     SwitchToThread :: () -> BOOL #foreign kernel32;
     SwitchToThread();
-}
-
-// @Todo: move it somewhere else
-debug_allocate_on_stack_aligned :: ($T: Type, stack: *[]u8, $initialize : bool) -> *T {
-    #assert initialize == false;
-    allocated   := (stack.data + stack.count - size_of(T)) & -execution_context_memory_alignment;
-    stack.count  = allocated - stack.data;
-    return xx allocated;
 }
 
 /// A tightly packed data structure that contains 16-byte aligned data pointer with 4-bit wide payload.

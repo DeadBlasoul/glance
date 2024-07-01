@@ -4,10 +4,10 @@ DispatchBarrier :: struct(count : s64 = 0) {
     lock_count : s64;
 
     #if count == {
-        case 0; lock_array : []Dispatch;
-                swap_array : []Dispatch;
+        case 0; lock_array : []DispatchSavepoint;
+                swap_array : []DispatchSavepoint;
 
-        case;   lock_array : [count - 1]Dispatch;
+        case;   lock_array : [count - 1]DispatchSavepoint;
     }
 }
 
@@ -25,7 +25,8 @@ arrive_and_wait :: (barrier : *DispatchBarrier) {
         resume_context := switch_dispatch_thread_execution_context_implicit(
             savepoint = *barrier.lock_array[lock_count],
             activate  = query_dispatch_looper(dispatch_thread_context),
-            reason    = .resumed
+            reason    = .resumed,
+            dispatch_thread_context
         );
         assert(unpack_reason(resume_context) == .resumed);
 
@@ -42,9 +43,9 @@ arrive_and_wait :: (barrier : *DispatchBarrier) {
     }
 
     // Save lock array before cleaning it. Otherwise, we might get in data race when barrier releasing collides with the next round locks.
-    lock_array : [barrier.count - 1]Dispatch = barrier.lock_array;
+    lock_array : [barrier.count - 1]DispatchSavepoint = barrier.lock_array;
 
-    memset(barrier.lock_array.data, 0, size_of(Dispatch) * barrier.lock_array.count);
+    memset(barrier.lock_array.data, 0, size_of(DispatchSavepoint) * barrier.lock_array.count);
     store(*barrier.lock_count, 0, memory_order = .release);
 
     // At this point barrier is set and done. We only need to resume suspended contexts.
@@ -53,7 +54,7 @@ arrive_and_wait :: (barrier : *DispatchBarrier) {
     dispatch_queue_dispatcher := dispatch_thread_context.dispatch_queue_dispatcher;
 
     for locked_context : lock_array {
-        while !try_enqueue(*dispatch_queue.work_queue, dispatch_queue_dispatcher, create_dispatch_work_item(locked_context)) {
+        while !try_enqueue(*dispatch_queue.work_queue, dispatch_queue_dispatcher, create_dispatch_work_item(consume_dispatch_from_immediate(locked_context))) {
             continue;
         }
 

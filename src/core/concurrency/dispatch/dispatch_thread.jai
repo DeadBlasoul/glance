@@ -22,6 +22,10 @@ DispatchThreadGroup :: enum {
     blocking;
 }
 
+is_dispatch_thread :: (dispatch_thread_context : *DispatchThreadContext) -> bool #no_context {
+    return dispatch_thread_context.dispatch_queue != null;
+}
+
 /// Sets new execution context for the current dispatch thread.
 /**
  * This function wraps the raw context manipulator `thread_switch_context_implicit` with dispatching primitives
@@ -34,24 +38,28 @@ DispatchThreadGroup :: enum {
  * @return Resume context on execution control regain.
  */
 switch_dispatch_thread_execution_context_implicit :: (
-    savepoint                 : *Dispatch,
+    savepoint                 : *DispatchSavepoint,
     activate                  : Dispatch,
     resume_context            : DispatchResumeContext,
-    $$dispatch_thread_context : *DispatchThreadContext = null
-) -> DispatchResumeContext #must #no_context {
-    #if is_constant(dispatch_thread_context) && dispatch_thread_context == null {
-        dtc := get_dispatch_thread_context();
+    $$dispatch_thread_context : *DispatchThreadContext
+) -> DispatchResumeContext #must #no_context #deprecated {
+    #if is_constant(dispatch_thread_context) {
+        #if dispatch_thread_context == null then dispatch_thread_context := get_dispatch_thread_context();
     } else {
-        assert(dispatch_thread_context != null);
-        dtc := dispatch_thread_context;
+        todo("Restore assert(dispatch_thread_context != null)");
+        // assert(dispatch_thread_context != null);
     }
 
-    saved_dispatch_context := dtc.dispatch_context;
+    todo("Restore assert(is_dispatch_thread(dispatch_thread_context))");
+    // assert(is_dispatch_thread(dispatch_thread_context), "This function cannot be invoked on non-dispatch threads.");
+
+    saved_dispatch_context := dispatch_thread_context.dispatch_context;
 
     //
     // Apply new execution context. This will invalidate all thread-local specific data,
     // so we cannot save the current thread context just before making the call.
     //
+
     resume_context = xx thread_switch_context_implicit(
         suspend        = cast(*ExecutionContext) savepoint,
         activate       = cast(ExecutionContext) activate,
@@ -61,20 +69,23 @@ switch_dispatch_thread_execution_context_implicit :: (
     //
     // Restore dispatch context.
     //
+
     get_dispatch_thread_context().dispatch_context = saved_dispatch_context;
 
     return resume_context;
 }
 
 switch_dispatch_thread_execution_context_implicit :: inline (
-    savepoint : *Dispatch,
-    activate  : Dispatch,
-    reason    : DispatchResumeReason
+    savepoint                 : *DispatchSavepoint,
+    activate                  : Dispatch,
+    reason                    : DispatchResumeReason,
+    $$dispatch_thread_context : *DispatchThreadContext
 ) -> DispatchResumeContext #must #no_context {
     return switch_dispatch_thread_execution_context_implicit(
-        savepoint      = savepoint,
-        activate       = activate,
-        resume_context = cast(DispatchResumeContext) reason
+        savepoint               = savepoint,
+        activate                = activate,
+        resume_context          = cast(DispatchResumeContext) reason,
+        dispatch_thread_context = dispatch_thread_context
     );
 }
 
@@ -114,7 +125,7 @@ switch_dispatch_thread_execution_context_explicit :: (
 }
 
 /// Discards the current execution context by setting a new one. The suspended context will never be resumed.
-discard_dispatch_thread_execution_context_explicit :: inline (
+discard_dispatch_thread_execution_context_explicit :: (
     activate : Dispatch,
     reason   : DispatchResumeReason
 ) #no_context {
@@ -136,8 +147,8 @@ DispatchThreadContext :: struct {
     dispatch_queue_implicit_hash : u64;
 
     /// Execution context of a looper that was set to this thread. If null, a new one should be allocated.
-    dispatch_thread_starter      : Dispatch;
-    dispatch_thread_looper       : Dispatch;
+    dispatch_thread_starter      : DispatchSavepoint;
+    dispatch_thread_looper       : DispatchSavepoint;
     dispatch_thread_index        : s64;
 }
 #assert size_of(DispatchThreadContext) <= dispatch_thread_context_reserved_size;
@@ -179,4 +190,5 @@ unpack_dispatch_context :: inline (resume_context : DispatchResumeContext) -> *D
     dispatch_thread_lib :: #library,no_dll "dispatch_thread_windows_x64";
 }
 
+#import "core/compile_time_support";
 #import "core/utility";

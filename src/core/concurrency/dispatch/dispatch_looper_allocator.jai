@@ -174,7 +174,7 @@ release_dispatch_looper :: (dispatch_looper : Dispatch) {
             allocation_map, image_index := unpack_allocation_slot(dispatch_memory.dispatch_context.allocation_slot);
             atomic_bit_set(allocation_map, image_index);
 
-            dispatch_memory.dispatch_context.savepoint = dispatch_looper;
+            dispatch_memory.dispatch_context.savepoint = serialize_dispatch(dispatch_looper);
         }
 
         // Dispatch memory was allocated by the OS.
@@ -207,7 +207,7 @@ shutdown_dispatch_looper :: (dispatch_looper : Dispatch) {
 }
 
 request_dispatch_stop :: (dispatch : Dispatch) {
-    resume_context  := switch_dispatch_thread_execution_context_explicit(activate = dispatch, reason = .stop);
+    resume_context := switch_dispatch_thread_execution_context_explicit(activate = dispatch, reason = .stop);
     assert(unpack_reason(resume_context) == .resumed);
 }
 

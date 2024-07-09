@@ -25,10 +25,10 @@ arrive_and_wait :: (barrier : *DispatchBarrier) {
         resume_context := switch_dispatch_thread_execution_context_implicit(
             savepoint = *barrier.lock_array[lock_count],
             activate  = query_dispatch_looper(dispatch_thread_context),
-            reason    = .resumed,
+            reason    = .resume,
             dispatch_thread_context
         );
-        assert(unpack_reason(resume_context) == .resumed);
+        assert(unpack_reason(resume_context) == .resume);
 
         return;
     }
@@ -54,7 +54,7 @@ arrive_and_wait :: (barrier : *DispatchBarrier) {
     dispatch_queue_dispatcher := dispatch_thread_context.dispatch_queue_dispatcher;
 
     for locked_context : lock_array {
-        while !try_enqueue(*dispatch_queue.work_queue, dispatch_queue_dispatcher, create_dispatch_work_item(consume_dispatch_from_immediate(locked_context))) {
+        while !try_enqueue(*dispatch_queue.dispatch_work_queue, dispatch_queue_dispatcher, create_dispatch_work_item(consume_dispatch_from_immediate(locked_context))) {
             continue;
         }
 

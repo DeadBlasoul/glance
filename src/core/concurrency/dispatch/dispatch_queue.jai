@@ -1,38 +1,41 @@
-WORK_POOL_CAPACITY           :: 32;
+WORK_POOL_CAPACITY           :: 128;
 CONTEXT_MEMORY_POOL_CAPACITY :: 32;
 
 #scope_export
 
 DispatchQueue :: struct {
-    work_queue        : DispatchWorkQueue;
-    running_threads   : s64;
-    progress          : Windows.HANDLE;
-    progress_finished : Windows.HANDLE;
+    running_threads     : s64;
+    progress            : Windows.HANDLE;
+    progress_finished   : Windows.HANDLE;
 
-    dispatch_looper_allocator : DispatchLooperAllocator(dispatch_stack_memory_size = 1 * 1024 * 1024, dispatch_memory_images_per_thread = 2);
-    dispatch_thread_pool      : [..]DispatchThread;
+    dispatch_looper_allocator  : DispatchLooperAllocator(dispatch_stack_memory_size = 1 * 1024 * 1024, dispatch_memory_images_per_thread = 2);
+    dispatch_work_queue        : DispatchWorkQueue;
+    dispatch_thread_pool       : [..]DispatchThread;
+    dispatch_side_channel_size : s64;
 }
 
-create_dispatch_queue :: (using dispatch_queue : *DispatchQueue, number_of_threads : s64) {
-    create_queue(*work_queue, number_of_threads);
+create_dispatch_queue :: (dispatch_queue : *DispatchQueue, dispatch_concurrency : s64, dispatch_side_channel_size : s64 = 1) {
+    assert(dispatch_side_channel_size > 0);
 
-    create_dispatch_looper_allocator(*dispatch_looper_allocator, number_of_threads);
+    dispatch_queue.dispatch_side_channel_size = dispatch_side_channel_size;
 
-    progress          = Windows.CreateEventA(null, 0, 0, null);
-    progress_finished = Windows.CreateEventA(null, 1, 0, null);
-    running_threads   = number_of_threads;
+    create_dispatch_looper_allocator(*dispatch_queue.dispatch_looper_allocator, dispatch_concurrency);
+    create_queue(*dispatch_queue.dispatch_work_queue, dispatch_concurrency + dispatch_side_channel_size);
 
-    Basic.array_resize(*dispatch_thread_pool, number_of_threads);
-    for *thread, thread_ix : dispatch_thread_pool {
+    dispatch_queue.progress          = Windows.CreateEventA(null, 0, 0, null);
+    dispatch_queue.progress_finished = Windows.CreateEventA(null, 1, 0, null);
+    dispatch_queue.running_threads   = dispatch_concurrency;
+
+    Basic.array_resize(*dispatch_queue.dispatch_thread_pool, dispatch_concurrency);
+    for *thread, thread_ix : dispatch_queue.dispatch_thread_pool {
         // @Todo: Reduce stack size because we don't use it anyway.
         Thread.thread_init(thread, xx dispatch_thread_starter); {
             thread.dispatch_queue        = dispatch_queue;
             thread.dispatch_thread_index = thread_ix;
         }
     }
-}
 
-start_dispatch_queue :: (dispatch_queue : *DispatchQueue) {
+    /* Startup threads. */
     for *thread : dispatch_queue.dispatch_thread_pool {
         Thread.thread_start(thread);
     }
@@ -53,24 +56,54 @@ destroy_dispatch_queue :: (using dispatch_queue: *DispatchQueue) {
         Thread.thread_deinit(thread);
     }
 
-    destroy_queue(*work_queue);
+    destroy_queue(*dispatch_work_queue);
     destroy_dispatch_looper_allocator(*dispatch_looper_allocator);
 }
 
 dispatch_async :: (queue: *DispatchQueue, task_context : *T, dispatch_work : (task_context : *$T) -> ()) {
     assert(task_context & dispatch_work_item_type_mask == null, "task context must be aligned by %", dispatch_work_item_type_mask + 1);
 
-    dispatcher := create_implicit_dispatcher(queue);
+    dispatcher := create_implicit_dispatcher(queue, get_dispatch_thread_context());
     work_item  := create_dispatch_work_item(
         task_context = task_context,
         task_routine = dispatch_work
     );
 
-    success := try_enqueue(*queue.work_queue, dispatcher, work_item);
+    // @Todo: We have to do something about unsuccessful enqueue. If it fires in release build, we are screwed.
+    success := try_enqueue(*queue.dispatch_work_queue, dispatcher, work_item);
     assert(success);
 
     SetEvent(queue.progress);
 }
+
+dispatch_async :: (dispatch_queue : *DispatchQueue, dispatch_work : () -> ()) {
+    dispatcher := create_implicit_dispatcher(dispatch_queue, get_dispatch_thread_context());
+    work_item  := create_dispatch_work_item(
+        task_context = null,
+        task_routine = cast((*void) -> ()) xx dispatch_work
+    );
+
+    // @Todo: We have to do something about unsuccessful enqueue. If it fires in release build, we are screwed.
+    success := try_enqueue(*dispatch_queue.dispatch_work_queue, dispatcher, work_item);
+    assert(success);
+
+    SetEvent(dispatch_queue.progress);
+}
+
+#scope_file
+
+dispatch_async :: (dispatch_queue : *DispatchQueue, dispatch : Dispatch, dispatch_thread_context : *DispatchThreadContext) {
+    dispatcher    := create_implicit_dispatcher(dispatch_queue, dispatch_thread_context);
+    new_work_item := create_dispatch_work_item(dispatch);
+
+    // @Todo: We have to do something about unsuccessful enqueue. If it fires in release build, we are screwed.
+    success := try_enqueue(*dispatch_queue.dispatch_work_queue, dispatcher, new_work_item);
+    assert(success);
+
+    SetEvent(dispatch_queue.progress);
+}
+
+#scope_export
 
 DispatchMode :: enum {
     /** Attempts to schedule task with waking up any free dispatch thread */
@@ -88,7 +121,8 @@ dispatch_async_locally :: ($dispatch_mode : DispatchMode, task_context : *T, dis
         task_routine = dispatch_work
     );
 
-    success := try_enqueue(*dispatch_thread_context.dispatch_queue.work_queue, dispatch_thread_context.dispatch_queue_dispatcher, work_item);
+    // @Todo: We have to do something about unsuccessful enqueue. If it fires in release build, we are screwed.
+    success := try_enqueue(*dispatch_thread_context.dispatch_queue.dispatch_work_queue, dispatch_thread_context.dispatch_queue_dispatcher, work_item);
     assert(success);
 
     #if dispatch_mode == .immediate {
@@ -96,7 +130,7 @@ dispatch_async_locally :: ($dispatch_mode : DispatchMode, task_context : *T, dis
     }
 }
 
-dispatch_yield_locally :: () {
+yield_this_dispatch :: () {
     dispatch_thread_context := get_dispatch_thread_context();
     dispatch_thread_looper  := query_dispatch_looper(dispatch_thread_context);
 
@@ -105,11 +139,38 @@ dispatch_yield_locally :: () {
     resume_context := switch_dispatch_thread_execution_context_explicit(activate = dispatch_thread_looper, reason = .yield);
 }
 
+migrate_this_dispatch_on :: (dispatch_queue : *DispatchQueue) {
+    dispatch_thread_context := get_dispatch_thread_context();
+    dispatch_thread_looper  := query_dispatch_looper(dispatch_thread_context);
+
+    migrate_info := DispatchMigrateInfo.{
+        another_dispatch_queue = dispatch_queue
+    };
+
+    resume_context := switch_dispatch_thread_execution_context_implicit(
+        savepoint = *migrate_info.suspended,
+        activate  = dispatch_thread_looper,
+        reason    = .migrate,
+        payload   = *migrate_info,
+        dispatch_thread_context
+    );
+
+    assert(unpack_reason(resume_context) == .resume);
+}
+
 #scope_module
 
-create_implicit_dispatcher :: (dispatch_queue : *DispatchQueue) -> DispatchWorkQueueImplicitDispatcher {
-    // @Todo: implement it properly
-    return acquire_producer_token(*dispatch_queue.work_queue, subqueue_index = 0, token_type = DispatchWorkQueueImplicitDispatcher);
+/// Creates new implicit dispatcher for side channel in the queue.
+create_implicit_dispatcher :: (dispatch_queue : *DispatchQueue, dispatch_thread_context : *DispatchThreadContext) -> DispatchWorkQueueImplicitDispatcher {
+    hash := Hash.fnv1a_hash(dispatch_thread_context.dispatch_queue_implicit_hash);
+    dispatch_thread_context.dispatch_queue_implicit_hash = hash;
+
+    offset := dispatch_queue.dispatch_thread_pool.count;
+    return acquire_producer_token(
+        queue          = *dispatch_queue.dispatch_work_queue,
+        subqueue_index = offset + xx (hash % xx dispatch_queue.dispatch_side_channel_size),  // @Cleanup: xx mess
+        token_type     = DispatchWorkQueueImplicitDispatcher
+    );
 }
 
 DispatchWorkQueue :: ConcurrentQueue(
@@ -149,7 +210,7 @@ dispatch_thread_starter :: (thread : *DispatchThread) -> s64 {
         dispatch_context = null,
 
         dispatch_queue               = thread.dispatch_queue,
-        dispatch_queue_dispatcher    = acquire_producer_token(*thread.dispatch_queue.work_queue, thread.dispatch_thread_index, token_type = DispatchWorkQueueLocalDispatcher),
+        dispatch_queue_dispatcher    = acquire_producer_token(*thread.dispatch_queue.dispatch_work_queue, thread.dispatch_thread_index, token_type = DispatchWorkQueueLocalDispatcher),
         dispatch_queue_implicit_hash = cast(u64) thread.dispatch_thread_index,
 
         dispatch_thread_index  = thread.dispatch_thread_index,
@@ -166,7 +227,7 @@ dispatch_thread_starter :: (thread : *DispatchThread) -> s64 {
     resume_context := switch_dispatch_thread_execution_context_implicit(
         savepoint = *dispatch_thread_context.dispatch_thread_starter,
         activate  = query_dispatch_looper(dispatch_thread_context),
-        reason    = .resumed,
+        reason    = .resume,
         dispatch_thread_context
     );
 
@@ -185,127 +246,148 @@ dispatch_thread_starter :: (thread : *DispatchThread) -> s64 {
     }
 
     //
-    // Release dispatch that requested thread stop.
+    // Suspend dispatch that requested thread stop.
     //
 
     resume_reason   := unpack_reason(resume_context);
-    source_dispatch := unpack_source(resume_context);
+    source_dispatch := unpack_payload(resume_context, reason = .yield);
 
-    assert(resume_reason   == .resumed);
+    assert(resume_reason == .yield);
     assert(source_dispatch != .invalid);
 
-    release_dispatch_looper(source_dispatch);
+    suspend_dispatch_looper(source_dispatch);
 
     //
-    // Release dispatch thread looper if it's set.
+    // Suspend dispatch thread looper if it's set.
     //
 
     dispatch_thread_context = get_dispatch_thread_context();
     dispatch_thread_looper := consume_dispatch(*dispatch_thread_context.dispatch_thread_looper);
 
-    if dispatch_thread_looper != .invalid then release_dispatch_looper(dispatch_thread_looper);
+    if dispatch_thread_looper != .invalid then suspend_dispatch_looper(dispatch_thread_looper);
 
     return 0;
 }
 
-dispatch_looper_starter :: (resume_context : DispatchResumeContext, dispatch_looper_context : *DispatchContext) #c_call {
+dispatch_looper_starter :: (resume_context : DispatchResumeContext, dispatch_context : *DispatchContext) #c_call {
     //
     // Start looping.
     //
 
-    stop_requester_dispatch : Dispatch = ---;
-    jai_context             : Context;
+    stop_requster : Dispatch = ---;
+    jai_context   : Context;
 
     push_context jai_context {
-        stop_requester_dispatch = dispatch_looper_routine(resume_context);
+        stop_requster = dispatch_looper_routine(resume_context, dispatch_context);
     }
 
     //
-    // Finish thread by switching back to its starter.
+    // Finish dispatch by switching to dispatch stop requester.
     //
 
     discard_dispatch_thread_execution_context_explicit(
-        activate = stop_requester_dispatch,
-        reason   = .resumed
+        activate = stop_requster,
+        reason   = .stop
     );
 }
 
-dispatch_looper_routine :: (resume_context : DispatchResumeContext) -> (stop_requester_dispatch : Dispatch) {
+DispatchWorkQueueConsumeToken :: ConsumerToken(DispatchWorkQueue, attributes = .{syncing = .enabled, queuing = .broadwide});
+
+dispatch_looper_routine :: (resume_context : DispatchResumeContext, dispatch_context : *DispatchContext) -> (stop_requster : Dispatch) {
     dispatch_thread_context := get_dispatch_thread_context();
-
-    dispatch_queue := dispatch_thread_context.dispatch_queue;
-    thread_index   := dispatch_thread_context.dispatch_thread_index;
-
-    dispatch_consume_token := acquire_consumer_token(
-        queue          = *dispatch_queue.work_queue,
-        subqueue_index = thread_index,
-        attributes     = .{
-            syncing = .enabled,
-            queuing = .broadwide,
-        }
-    );
-
-    process_resume_action :: (resume_context : DispatchResumeContext) #expand {
-        if #complete unpack_reason(resume_context) == {
-            case .resumed;
-                // No-op
-
-            case .yield;
-                suspended := unpack_source(resume_context);
-                work_item := create_dispatch_work_item(suspended);
-
-                success := try_enqueue(*`dispatch_queue.work_queue, `dispatch_thread_context.dispatch_queue_dispatcher, work_item);
-                assert(success);
-
-            case .stop;
-                stop_requester_dispatch := unpack_source(resume_context);
-                `return stop_requester_dispatch;
-        }
-    }
-
-    //
-    // Preprocess resume context beforehand as it might have pending actions to account.
-    //
-
-    process_resume_action(resume_context);
-
-    //
-    // Start looping.
-    //
-
-    decide_next_sleeping_mode :: inline (sleeping_index_counter : *s64) -> enum {sleep_in_user_mode; sleep_in_kernel_mode;} #no_context {
-        if sleeping_index_counter.* < 20 {
-            sleeping_index_counter.* += 1;
-            return .sleep_in_user_mode;
-        }
-        return .sleep_in_kernel_mode;
-    }
-
-    sleeping_index_counter := 0;
+    dispatch_queue          := dispatch_thread_context.dispatch_queue;
+    dispatch_thread_index   := -1; //! Just to hit thread index check at the start of the first loop.
+    dispatch_consume_token  : DispatchWorkQueueConsumeToken = ---;
 
     while looping := true {
-        work_item : DispatchWorkItem = ---;
+        /* Processing of `stop` request cannot access any thread-local states (it's a requirement), so it must be done beforehand. */
+        if unpack_reason(resume_context) == .stop then return unpack_payload(resume_context, reason = .stop);
 
         //
-        // Consume dispatch.
+        // Check whether we've been migrated to another dispatch thread or not.
         //
 
-        if !try_dequeue(*dispatch_queue.work_queue, dispatch_consume_token, *work_item) {
-            if load(*dispatch_queue.dispatch_thread_pool[thread_index].should_stop, memory_order = .acquire) {
-                work_item = create_dispatch_thread_stop_request();
-            } else {
-                if #complete decide_next_sleeping_mode(*sleeping_index_counter) == {
-                    case .sleep_in_user_mode;
-                        sleep_in_user_mode(sleep_cycles = 25_000);
+        dispatch_thread_context = get_dispatch_thread_context();
 
-                    case .sleep_in_kernel_mode;
-                        Windows.WaitForSingleObject(dispatch_queue.progress, milliseconds = 1);
-                }
-                continue looping;
-            }
+        if dispatch_thread_context.dispatch_queue != dispatch_queue && dispatch_context.allocation_slot != .system {
+            /* Far away move has happened. We would like to stop the current dispatch and release it back to homeland. */
+            resume_context = suspend_current_dispatch(resume_context, dispatch_thread_context, on_resume = #code { dispatch_thread_context = get_dispatch_thread_context(); });
+
+            /* Make sure that we actually moved to our own dispatch queue. */
+            assert(dispatch_thread_context.dispatch_queue == dispatch_queue);
+        } else {
+            /* The allocation source is system, so no difference what dispatch queue allocated this dispatch; we can move on just fine. */
+            dispatch_queue = dispatch_thread_context.dispatch_queue;
         }
 
-        sleeping_index_counter = 0;
+        if dispatch_thread_context.dispatch_thread_index != dispatch_thread_index {
+            dispatch_thread_index  = dispatch_thread_context.dispatch_thread_index;
+            dispatch_consume_token = acquire_consumer_token(*dispatch_queue.dispatch_work_queue, subqueue_index = dispatch_thread_index, token_type = DispatchWorkQueueConsumeToken);
+        }
+
+        //
+        // Process resume context.
+        //
+
+        while processing_resume_context := true {
+            if #complete unpack_reason(resume_context) == {
+                case .resume;
+                    // No-op.
+
+                case .yield;
+                    /* @Warning: In the current design, yield has a greater priority since it does local dispatching before next consuming.
+                                 If there are no jobs in the local queue, yielded dispatch will regain execution despite existing of other tasks globally.
+
+                                 As a side effect, yield might overflow local queue. We could've make pre-consume, but it increases memory pressure on allocation system.
+                                 To prevent any unexpected outcomes, such an overflow would terminate the app even if we are running a release build. */
+
+                    yielded_dispatch := unpack_payload(resume_context, reason = .yield);
+                    new_work_item    := create_dispatch_work_item(yielded_dispatch);
+
+                    if !try_enqueue(*dispatch_queue.dispatch_work_queue, *dispatch_thread_context.dispatch_queue_dispatcher, new_work_item) then trigger_access_violation();
+
+                case .suspend;
+                    suspend_info := unpack_payload(resume_context, .suspend);
+                    suspend_dispatch_looper(consume_dispatch_from_immediate(suspend_info.suspended));
+
+                    resume_context = suspend_info.pending_resume_context;
+                    continue processing_resume_context;
+
+                case .migrate;
+                    migrate_info := unpack_payload(resume_context, .migrate);
+                    dispatch_async(migrate_info.another_dispatch_queue, consume_dispatch_from_immediate(migrate_info.suspended), dispatch_thread_context);
+
+                case .stop;
+                    unreachable();
+            }
+
+            break processing_resume_context;
+        }
+
+        //
+        // Consume next dispatch.
+        //
+
+        work_item : DispatchWorkItem = ---;
+
+        while consuming := true {
+            if load(*dispatch_queue.dispatch_thread_pool[dispatch_thread_index].should_stop, memory_order = .acquire) {
+                resume_context = switch_dispatch_thread_execution_context_explicit(
+                    activate = consume_dispatch(*dispatch_thread_context.dispatch_thread_starter),
+                    reason   = .yield
+                );
+                continue looping;
+            }
+
+            if !try_dequeue(*dispatch_queue.dispatch_work_queue, dispatch_consume_token, *work_item) {
+                // @Todo: Do user mode sleep for a short period of time if available.
+                Windows.WaitForSingleObject(dispatch_queue.progress, milliseconds = 1);
+                continue consuming;
+            }
+
+            /* Successful consume. */
+            break consuming;
+        }
 
         //
         // Execute dispatch.
@@ -318,70 +400,42 @@ dispatch_looper_routine :: (resume_context : DispatchResumeContext) -> (stop_req
                 task_routine(task_context);
                 Basic.reset_temporary_storage();
 
-                dispatch_thread_context = get_dispatch_thread_context();
+                resume_context = .none;
 
             case .dispatched_context;
-                dispatched_context := unpack_as_dispatched_context(work_item);
+                dispatch := unpack_as_dispatched_context(work_item);
 
                 dispatch_thread_looper := consume_dispatch(*dispatch_thread_context.dispatch_thread_looper);
-                if dispatch_thread_looper != .invalid then release_dispatch_looper(dispatch_thread_looper);
+                if dispatch_thread_looper != .invalid then suspend_dispatch_looper(dispatch_thread_looper);
 
                 resume_context = switch_dispatch_thread_execution_context_implicit(
                     savepoint = *dispatch_thread_context.dispatch_thread_looper,
-                    activate  = dispatched_context,
-                    reason    = .resumed,
+                    activate  = dispatch,
+                    reason    = .resume,
                     dispatch_thread_context
                 );
-
-                dispatch_thread_context = get_dispatch_thread_context();
-                process_resume_action(resume_context);
-
-            case .dispatch_thread_stop_request;
-                resume_context = switch_dispatch_thread_execution_context_explicit(
-                    activate = consume_dispatch(*dispatch_thread_context.dispatch_thread_starter),
-                    reason   = .resumed
-                );
-
-                dispatch_thread_context = get_dispatch_thread_context();
-                process_resume_action(resume_context);
-        }
-
-        //
-        // Update looper environment.
-        //
-
-        if dispatch_queue != dispatch_thread_context.dispatch_queue || thread_index != dispatch_thread_context.dispatch_thread_index {
-            dispatch_queue = dispatch_thread_context.dispatch_queue;
-            thread_index   = dispatch_thread_context.dispatch_thread_index;
-
-            dispatch_consume_token = acquire_consumer_token(
-                queue          = *dispatch_queue.work_queue,
-                subqueue_index = thread_index,
-                attributes     = .{
-                    syncing = .enabled,
-                    queuing = .broadwide,
-                }
-            );
         }
     }
 }
 
-shutdown_context :: inline (activate : Dispatch, looper_context : *DispatchContext) #deprecated "Must be removed, out of module structure" {
-    thread_set_context(
-        activate       = cast(ExecutionContext) activate,
-        resume_context = create_resume_context(
-            resume_data    = looper_context,
-            resume_payload = cast(u64) DispatchResumeReason.resumed // ???
-        )
-    );
-}
+suspend_current_dispatch :: (resume_context : DispatchResumeContext, dispatch_thread_context : *DispatchThreadContext, $on_resume : Code) -> DispatchResumeContext #expand {
+    suspend_info := DispatchSuspendInfo.{pending_resume_context = resume_context};
 
-_endthreadex :: (retval : u32) #foreign;
+    resume_context = switch_dispatch_thread_execution_context_implicit(
+        savepoint = *suspend_info.suspended,
+        activate  = query_dispatch_looper(dispatch_thread_context),
+        reason    = .suspend,
+        payload   = *suspend_info,
+        dispatch_thread_context
+    );
+
+    #insert on_resume;
+
+    return resume_context;
+}
 
 SetEvent :: (hEvent: Windows.HANDLE) -> bool #foreign kernel32;
 SetThreadAffinityMask :: (h: Windows.HANDLE, mask: s64) -> Windows.BOOL #foreign;
-ExitThread :: (exit_code: u32) -> void #foreign kernel32;
-SwitchToThread :: () -> Windows.BOOL #foreign kernel32;
 
 Basic   :: #import "Basic";
 Thread  :: #import "Thread";

@@ -165,8 +165,10 @@ create_dispatch_looper :: (allocator : *DispatchLooperAllocator, dispatch_thread
     return cast(Dispatch) thread_create_execution_context(dispatch_memory.stack_area, *dispatch_memory.dispatch_context, xx dispatch_looper_starter);
 }
 
-release_dispatch_looper :: (dispatch_looper : Dispatch) {
+suspend_dispatch_looper :: (dispatch_looper : Dispatch) {
     dispatch_memory := restore_dispatch_memory_pointer(dispatch_looper);
+
+    Log.error("#(%) Releasing dispatch memory: %", get_dispatch_thread_id(), dispatch_memory);
 
     if dispatch_memory.dispatch_context.allocation_slot == {
         // Dispatch memory was allocated from an arena.
@@ -208,7 +210,7 @@ shutdown_dispatch_looper :: (dispatch_looper : Dispatch) {
 
 request_dispatch_stop :: (dispatch : Dispatch) {
     resume_context := switch_dispatch_thread_execution_context_explicit(activate = dispatch, reason = .stop);
-    assert(unpack_reason(resume_context) == .resumed);
+    assert(unpack_reason(resume_context) == .stop);
 }
 
 allocate_dispatch_memory :: (using allocator : *DispatchLooperAllocator, dispatch_thread_index : s64) -> *DispatchMemoryImage {
@@ -218,29 +220,28 @@ allocate_dispatch_memory :: (using allocator : *DispatchLooperAllocator, dispatc
 
     threads_count := memory_control_blocks.count;
 
-    // Iterate over each memory control block starting from the one corresponding to the index of desired dispatch thread.
+    /* Iterate over each memory control block starting from the one corresponding to the index of desired dispatch thread. */
     for forward_thread_index : dispatch_thread_index..dispatch_thread_index + threads_count - 1 {
         memory_control_block_index := forward_thread_index % threads_count;
         allocation_map             := *memory_control_blocks[memory_control_block_index].allocation_map;
 
         while allocating_within_current_control_block := true {
-            // candidate_image_index := trailing_zeroes_count(load(allocation_map, memory_order = .acquire));
-            candidate_image_index := trailing_zeroes_count(allocation_map);
+            candidate_image_index := trailing_zeroes_count(load(allocation_map, memory_order = .acquire));
 
-            // Check for out-of-memory within current control block.
+            /* Check for out-of-memory within current control block. */
             if candidate_image_index >= dispatch_memory_images_per_thread {
                 break allocating_within_current_control_block;
             }
 
-            // Attempt to commit memory allocation.
+            /* Attempt to commit memory allocation. */
             if atomic_bit_test_and_reset(allocation_map, candidate_image_index) == false {
                 continue allocating_within_current_control_block;
             }
 
             memory := *memory_arena[memory_control_block_index * dispatch_memory_images_per_thread + candidate_image_index];
-            Log.debug("New memory block is just allocated: %", memory);
+            Log.debug("#(%) Local allocation: %", get_dispatch_thread_id(), memory);
 
-            // Allocation is successful, return commited memory.
+            /* Successful allocation. */
             return memory;
         }
     }
@@ -267,7 +268,7 @@ allocate_dispatch_memory :: (using allocator : *DispatchLooperAllocator, dispatc
 
     operational_stack_area_size :: #run Basic.min(allocator.dispatch_stack_memory_size, image.stack_area.count);
 
-    // Commit dispatch context.
+    /* Commit dispatch context. */
     os_allocate_memory(
         base            = *image.dispatch_context, //< Will round down to beginning of the page where allocation is being on (at least, on Windows).
         size            = size_of(DispatchContext),
@@ -275,7 +276,7 @@ allocate_dispatch_memory :: (using allocator : *DispatchLooperAllocator, dispatc
         allocation_type = .commit
     );
 
-    // Commit operational part of the stack area.
+    /* Commit operational part of the stack area. */
     os_allocate_memory(
         base            = image.stack_area.data + image.stack_area.count - operational_stack_area_size,
         size            = operational_stack_area_size,
@@ -283,8 +284,8 @@ allocate_dispatch_memory :: (using allocator : *DispatchLooperAllocator, dispatc
         allocation_type = .commit
     );
 
-    // Map the rest of the stack area as "no access". Guard area must be set as the last one to make it always existing
-    // even if `operational_stack_area_size` is equal to the size of stack area.
+    /* Map the rest of the stack area as "no access". Guard area must be set as the last one to make it always existing
+       even if `operational_stack_area_size` is equal to the size of stack area. */
     success, effective_guard_area := os_protect_memory(
         base       = image.guard_area.data,
         size       = image.stack_area.count - operational_stack_area_size,
@@ -309,6 +310,8 @@ allocate_dispatch_memory :: (using allocator : *DispatchLooperAllocator, dispatc
         effective_stack_size = effective_stack_area_size,
         allocation_slot      = .system,
     };
+
+    Log.warning("#(%) System allocation: %", get_dispatch_thread_id(), image);
 
     return image;
 }

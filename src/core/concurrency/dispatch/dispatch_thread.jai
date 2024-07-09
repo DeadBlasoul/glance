@@ -1,6 +1,6 @@
 #scope_export
 
-/// Returns linear index of the current dispatch thread. Might be not unique if there is another dispatch queue.
+/// Returns local index of the current dispatch thread. Not unique accross different dispatch queues.
 get_dispatch_thread_id :: inline () -> s64 #no_context {
     return get_dispatch_thread_context().dispatch_thread_index;
 }
@@ -12,14 +12,8 @@ DispatchThread :: struct {
 
     dispatch_queue        : *DispatchQueue;
     dispatch_thread_index : s64;
-    group                 : DispatchThreadGroup;
 
     should_stop : bool;
-}
-
-DispatchThreadGroup :: enum {
-    dispatch;
-    blocking;
 }
 
 is_dispatch_thread :: (dispatch_thread_context : *DispatchThreadContext) -> bool #no_context {
@@ -81,6 +75,8 @@ switch_dispatch_thread_execution_context_implicit :: inline (
     reason                    : DispatchResumeReason,
     $$dispatch_thread_context : *DispatchThreadContext
 ) -> DispatchResumeContext #must #no_context {
+    todo("`reason` is always compile-time evaluated; force it explicitly");
+
     return switch_dispatch_thread_execution_context_implicit(
         savepoint               = savepoint,
         activate                = activate,
@@ -88,6 +84,31 @@ switch_dispatch_thread_execution_context_implicit :: inline (
         dispatch_thread_context = dispatch_thread_context
     );
 }
+
+switch_dispatch_thread_execution_context_implicit :: inline (
+    savepoint                 : *DispatchSavepoint,
+    activate                  : Dispatch,
+    $reason                   : DispatchResumeReason,
+    payload                   : $DispatchResumePayload,
+    $$dispatch_thread_context : *DispatchThreadContext
+) -> DispatchResumeContext #modify {
+    if #complete reason == {
+        case .resume;  return false, "Resume context with `resume` reason has no additional payload.";
+        case .yield;   DispatchResumePayload = Dispatch;
+        case .suspend; DispatchResumePayload = *DispatchSuspendInfo;
+        case .migrate; DispatchResumePayload = *DispatchMigrateInfo;
+        case .stop;    DispatchResumePayload = Dispatch;
+    }
+    return true;
+} {
+    return switch_dispatch_thread_execution_context_implicit(
+        savepoint      = savepoint,
+        activate       = activate,
+        resume_context = xx create_resume_context(xx payload, xx reason),
+        dispatch_thread_context
+    );
+}
+
 
 /// Sets new execution context for the current dispatch thread. The current context handle will be passed within resume context.
 /**
@@ -127,8 +148,9 @@ switch_dispatch_thread_execution_context_explicit :: (
 /// Discards the current execution context by setting a new one. The suspended context will never be resumed.
 discard_dispatch_thread_execution_context_explicit :: (
     activate : Dispatch,
-    reason   : DispatchResumeReason
+    $reason  : DispatchResumeReason
 ) #no_context {
+    #assert reason == .stop "Discard action must be followed with `stop` reason.";
     _ := thread_switch_context(
         activate       = cast(ExecutionContext) activate,
         resume_payload = cast(u64) reason
@@ -158,12 +180,27 @@ dispatch_thread_context_reserved_size :: 64;  // Expected size of the context, u
 /// Returns runtime context of the current dispatch thread.
 get_dispatch_thread_context :: () -> *DispatchThreadContext #foreign dispatch_thread_lib;
 
-DispatchResumeContext :: #type,distinct ResumeContext;
+DispatchResumeContext :: enum s64 {
+    /// Identical to an empty resume context with reason "resumed".
+    none;
+}
 
-DispatchResumeReason :: enum {
-    resumed;
+DispatchResumeReason :: enum s64 {
+    resume;
     yield;
+    suspend;
+    migrate;
     stop;
+}
+
+DispatchSuspendInfo :: struct {
+    suspended              : DispatchSavepoint;
+    pending_resume_context : DispatchResumeContext;
+}
+
+DispatchMigrateInfo :: struct {
+    suspended              : DispatchSavepoint;
+    another_dispatch_queue : *DispatchQueue;
 }
 
 unpack_reason :: inline (resume_context : DispatchResumeContext) -> DispatchResumeReason #no_context {
@@ -171,14 +208,20 @@ unpack_reason :: inline (resume_context : DispatchResumeContext) -> DispatchResu
     return cast(DispatchResumeReason) get_resume_context_payload(raw_resume_context);
 }
 
-unpack_source :: inline (resume_context : DispatchResumeContext) -> Dispatch #no_context {
-    raw_resume_context := cast(ResumeContext) resume_context;
-    return cast(Dispatch) get_resume_context_data(raw_resume_context);
-}
+unpack_payload :: inline (resume_context : DispatchResumeContext, $reason : DispatchResumeReason) -> $R #modify {
+    if #complete reason == {
+        case .resume;  return false, "Resume context with `resume` reason has no additional payload.";
+        case .yield;   R = Dispatch;
+        case .suspend; R = *DispatchSuspendInfo;
+        case .migrate; R = *DispatchMigrateInfo;
+        case .stop;    R = Dispatch;
+    }
+    return true;
+} {
+    assert(unpack_reason(resume_context) == reason, "Attempted to unpack resume context payload with descriptive reason `%` when the actual is `%`.", reason, unpack_reason(resume_context));
 
-unpack_dispatch_context :: inline (resume_context : DispatchResumeContext) -> *DispatchContext #no_context {
     raw_resume_context := cast(ResumeContext) resume_context;
-    return cast(*DispatchContext) get_resume_context_data(raw_resume_context);
+    return cast(R) get_resume_context_data(raw_resume_context);
 }
 
 #scope_file
